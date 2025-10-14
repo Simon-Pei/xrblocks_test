@@ -224,7 +224,6 @@ export class Core {
     // Sets up device camera.
     if (options.deviceCamera?.enabled) {
       this.deviceCamera = new XRDeviceCamera(options.deviceCamera);
-      await this.deviceCamera.init();
       this.registry.register(this.deviceCamera);
     }
 
@@ -423,7 +422,10 @@ export class Core {
    * scripts.
    * @param session - The newly started WebXR session.
    */
-  private onXRSessionStarted(session: XRSession) {
+  private async onXRSessionStarted(session: XRSession) {
+    if (this.options.deviceCamera?.enabled) {
+      await this.deviceCamera!.init();
+    }
     this.scriptsManager.onXRSessionStarted(session);
   }
 

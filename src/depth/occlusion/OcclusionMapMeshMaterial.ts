@@ -69,7 +69,7 @@ export class OcclusionMapMeshMaterial extends THREE.MeshBasicMaterial {
               .replace('#include <dithering_fragment>', [
                 '#include <dithering_fragment>',
                 'vec4 texCoord = vec4(vTexCoord, 0, 1);',
-                'vec2 uv = vec2(texCoord.x, 1.0 - texCoord.y);',
+                'vec2 uv = vec2(texCoord.x, uIsTextureArray?texCoord.y:(1.0 - texCoord.y));',
                 'highp float real_depth = uIsTextureArray ? DepthArrayGetMeters(uDepthTextureArray, uv) : DepthGetMeters(uDepthTexture, uv);',
                 'gl_FragColor = vec4(step(vVirtualDepth, real_depth), 1.0, 0.0, 1.0);'
               ].join('\n'));
