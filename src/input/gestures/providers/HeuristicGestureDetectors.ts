@@ -1,13 +1,18 @@
 import * as THREE from 'three';
 
-import {GestureDetectorMap, HandContext} from '../GestureTypes';
 import {GestureConfiguration} from '../GestureRecognitionOptions';
+import {GestureDetectorMap, HandContext} from '../GestureTypes';
 
-const DEFAULT_PINCH_THRESHOLD = 0.03;
-const DEFAULT_FIST_THRESHOLD = 0.06;
-const DEFAULT_OPEN_PALM_THRESHOLD = 0.075;
-const DEFAULT_POINT_THRESHOLD = 0.07;
-const DEFAULT_SPREAD_THRESHOLD = 0.04;
+type FingerName = 'index'|'middle'|'ring'|'pinky';
+
+const EPSILON = 1e-6;
+const FINGER_ORDER: FingerName[] = ['index', 'middle', 'ring', 'pinky'];
+const FINGER_PREFIX: Record<FingerName, string> = {
+  index: 'index-finger',
+  middle: 'middle-finger',
+  ring: 'ring-finger',
+  pinky: 'pinky-finger',
+};
 
 export const heuristicDetectors: GestureDetectorMap = {
   'pinch': computePinch,
@@ -23,203 +28,297 @@ function computePinch(context: HandContext, config: GestureConfiguration) {
   const index = getJoint(context, 'index-finger-tip');
   if (!thumb || !index) return undefined;
 
-  const threshold = config.threshold ?? DEFAULT_PINCH_THRESHOLD;
+  const handScale = estimateHandScale(context);
+  const threshold = config.threshold ?? Math.max(0.018, handScale * 0.35);
   const distance = thumb.distanceTo(index);
-  const confidence =
-      1 - THREE.MathUtils.clamp(distance / (threshold * 1.5), 0, 1);
-  if (distance > threshold) return {confidence: confidence * 0.5};
+
+  if (!Number.isFinite(distance) || distance < EPSILON) {
+    return {confidence: 0};
+  }
+
+  const tightness = clamp01(1 - (distance / (threshold * 0.85)));
+  const loosePenalty = clamp01(1 - (distance / (threshold * 1.4)));
+  const confidence = clamp01(distance <= threshold ? tightness :
+                                                   loosePenalty * 0.4);
+
   return {
-    confidence: THREE.MathUtils.clamp(confidence, 0, 1),
-    data: {distance},
+    confidence,
+    data: {distance, threshold},
   };
 }
 
 function computeOpenPalm(context: HandContext, config: GestureConfiguration) {
-  const wrist = getJoint(context, 'wrist');
-  if (!wrist) return undefined;
+  const fingerMetrics = getFingerMetrics(context);
+  if (!fingerMetrics.length) return undefined;
+  const handScale = estimateHandScale(context);
+  const palmWidth = getPalmWidth(context) ?? handScale * 0.85;
 
-  const fingerTips = getFingerTips(context);
-  if (fingerTips.length === 0) return undefined;
+  const extensionScores = fingerMetrics.map(({tipDistance}) =>
+      clamp01((tipDistance - handScale * 0.5) / (handScale * 0.45)));
+  const straightnessScores = fingerMetrics.map(({curlRatio}) =>
+      clamp01((curlRatio - 1.1) / 0.5));
 
-  const distances = fingerTips.map(tip => tip.distanceTo(wrist));
-  const averageDistance =
-      distances.reduce((sum, val) => sum + val, 0) / distances.length;
+  const neighbors = getAdjacentFingerDistances(context);
+  const spreadScore =
+      neighbors.average !== Infinity && palmWidth > EPSILON ?
+      clamp01((neighbors.average - palmWidth * 0.55) / (palmWidth * 0.35)) :
+      0;
 
-  const palmWidth = getPalmWidth(context);
-  const baseThreshold =
-      palmWidth ? palmWidth * 0.9 : DEFAULT_OPEN_PALM_THRESHOLD;
-  const threshold = config.threshold ?? baseThreshold;
+  const extensionScore = average(extensionScores);
+  const straightScore = average(straightnessScores);
+  const confidence = clamp01(
+      (extensionScore * 0.5) + (straightScore * 0.3) + (spreadScore * 0.2));
 
-  const confidence = THREE.MathUtils.clamp(
-      (averageDistance - threshold) / (threshold * 0.75), 0, 1);
-  return {confidence, data: {averageDistance}};
+  return {
+    confidence,
+    data: {
+      extensionScore,
+      straightScore,
+      spreadScore,
+      threshold: config.threshold,
+    },
+  };
 }
 
 function computeFist(context: HandContext, config: GestureConfiguration) {
-  const wrist = getJoint(context, 'wrist');
-  if (!wrist) return undefined;
-  const fingerTips = getFingerTips(context);
-  if (fingerTips.length === 0) return undefined;
+  const fingerMetrics = getFingerMetrics(context);
+  if (!fingerMetrics.length) return undefined;
+  const handScale = estimateHandScale(context);
+  const palmWidth = getPalmWidth(context) ?? handScale * 0.85;
 
-  const distances = fingerTips.map(tip => tip.distanceTo(wrist));
-  const averageDistance =
-      distances.reduce((sum, val) => sum + val, 0) / distances.length;
-
-  const palmWidth = getPalmWidth(context);
-  const baseThreshold =
-      palmWidth ? palmWidth * 0.55 : DEFAULT_FIST_THRESHOLD;
-  const threshold = config.threshold ?? baseThreshold;
-
-  const proximityScore = THREE.MathUtils.clamp(
-      (threshold - averageDistance) / (threshold * 0.9), 0, 1);
+  const tipAverage =
+      average(fingerMetrics.map(metrics => metrics.tipDistance));
+  const curlAverage =
+      average(fingerMetrics.map(metrics => metrics.curlRatio));
 
   const neighbors = getAdjacentFingerDistances(context);
-  const spreadReference =
-      palmWidth ? palmWidth * 0.55 : DEFAULT_OPEN_PALM_THRESHOLD;
-  const clusteringScore = THREE.MathUtils.clamp(
-      (spreadReference - neighbors.average) / spreadReference, 0, 1);
+  const clusterScore =
+      neighbors.average !== Infinity && palmWidth > EPSILON ?
+      clamp01((palmWidth * 0.5 - neighbors.average) / (palmWidth * 0.35)) :
+      0;
 
-  const confidence = (proximityScore * 0.7) + (clusteringScore * 0.3);
+  const tipScore =
+      clamp01((handScale * 0.55 - tipAverage) / (handScale * 0.25));
+  const curlScore = clamp01((1.08 - curlAverage) / 0.25);
+  const confidence =
+      clamp01((tipScore * 0.5) + (curlScore * 0.35) + (clusterScore * 0.15));
+
   return {
-    confidence: THREE.MathUtils.clamp(confidence, 0, 1),
+    confidence,
     data: {
-      averageDistance,
-      neighborAverage: neighbors.average,
-      proximityScore,
-      clusteringScore,
+      tipAverage,
+      curlAverage,
+      clusterScore,
+      threshold: config.threshold,
     },
   };
 }
 
 function computeThumbsUp(context: HandContext, config: GestureConfiguration) {
-  const wrist = getJoint(context, 'wrist');
-  const thumbTip = getJoint(context, 'thumb-tip');
-  const fingerTips = getFingerTips(context).filter(tip => tip !== thumbTip);
-  if (!wrist || !thumbTip || fingerTips.length === 0) return undefined;
+  const thumbMetrics = getThumbMetrics(context);
+  const fingerMetrics = getFingerMetrics(context);
+  if (!thumbMetrics || fingerMetrics.length < 2) return undefined;
 
-  const thumbDistance = thumbTip.distanceTo(wrist);
-  const palmWidth = getPalmWidth(context);
-  const extendedThreshold =
-      config.threshold ?? (palmWidth ? palmWidth * 0.9 : DEFAULT_OPEN_PALM_THRESHOLD * 0.9);
+  const handScale = estimateHandScale(context);
+  const palmWidth = getPalmWidth(context) ?? handScale * 0.85;
+  const palmUp = getPalmUp(context);
 
-  const thumbDirection = new THREE.Vector3().subVectors(thumbTip, wrist);
-  const thumbVerticalScore =
-      THREE.MathUtils.clamp(thumbDirection.length() === 0 ?
-                                0 :
-                                thumbDirection.normalize().dot(
-                                    getPalmNormal(context) ?? new THREE.Vector3()),
-                            0, 1);
+  const otherCurls = fingerMetrics.map(m => m.curlRatio);
+  const curledScore = clamp01((1.05 - average(otherCurls)) / 0.25);
 
-  const otherDistances = fingerTips.map(tip => tip.distanceTo(wrist));
-  const averageOther =
-      otherDistances.reduce((sum, val) => sum + val, 0) / otherDistances.length;
-  const curledThreshold =
-      palmWidth ? palmWidth * 0.55 : DEFAULT_FIST_THRESHOLD * 1.1;
+  const thumbReachRatio =
+      thumbMetrics.referenceDistance > EPSILON ?
+      thumbMetrics.tipDistance / thumbMetrics.referenceDistance :
+      0;
+  const thumbExtendedScore = clamp01((thumbReachRatio - 1.15) / 0.5);
 
-  const thumbExtendedScore = THREE.MathUtils.clamp(
-      (thumbDistance - extendedThreshold) / (extendedThreshold * 0.6), 0, 1);
-  const othersCurledScore = THREE.MathUtils.clamp(
-      (curledThreshold - averageOther) / (curledThreshold * 0.9), 0, 1);
+  const indexTip = getJoint(context, 'index-finger-tip');
+  const thumbIndexDistance =
+      indexTip ? thumbMetrics.tip.distanceTo(indexTip) : 0;
+  const separationScore =
+      palmWidth > EPSILON ?
+      clamp01((thumbIndexDistance - palmWidth * 0.4) / (palmWidth * 0.25)) :
+      0;
 
-  const confidence = (thumbExtendedScore * 0.5) +
-      (othersCurledScore * 0.3) + (thumbVerticalScore * 0.2);
+  let orientationScore = 0;
+  if (palmUp) {
+    const thumbVector = new THREE.Vector3()
+                            .copy(thumbMetrics.tip)
+                            .sub(thumbMetrics.metacarpal ?? thumbMetrics.tip);
+    if (thumbVector.lengthSq() > EPSILON) {
+      thumbVector.normalize();
+      const alignment = thumbVector.dot(palmUp);
+      orientationScore = clamp01((alignment - 0.35) / 0.35);
+    }
+  }
+
+  const confidence = clamp01(
+      (thumbExtendedScore * 0.35) + (curledScore * 0.3) +
+      (orientationScore * 0.2) + (separationScore * 0.15));
+
   return {
-    confidence: THREE.MathUtils.clamp(confidence, 0, 1),
-    data: {thumbDistance, averageOther, thumbVerticalScore},
+    confidence,
+    data: {
+      thumbReachRatio,
+      curledScore,
+      orientationScore,
+      separationScore,
+      threshold: config.threshold,
+    },
   };
 }
 
 function computePoint(context: HandContext, config: GestureConfiguration) {
-  const wrist = getJoint(context, 'wrist');
-  const indexTip = getJoint(context, 'index-finger-tip');
-  const thumbTip = getJoint(context, 'thumb-tip');
-  if (!wrist || !indexTip) return undefined;
+  const indexMetrics = computeFingerMetric(context, 'index');
+  if (!indexMetrics) return undefined;
+  const otherMetrics =
+      FINGER_ORDER.slice(1).map(finger => computeFingerMetric(context, finger))
+          .filter(Boolean) as FingerMetrics[];
+  if (!otherMetrics.length) return undefined;
 
-  const otherTips = getFingerTips(context)
-                        .filter(tip => tip !== indexTip && tip !== thumbTip);
-  if (!otherTips.length) return undefined;
+  const handScale = estimateHandScale(context);
+  const indexCurlScore = clamp01((indexMetrics.curlRatio - 1.2) / 0.35);
+  const indexReachScore = clamp01(
+      (indexMetrics.tipDistance - handScale * 0.6) / (handScale * 0.25));
 
-  const indexDistance = indexTip.distanceTo(wrist);
-  const averageOthers =
-      otherTips.reduce((sum, tip) => sum + tip.distanceTo(wrist), 0) /
-      otherTips.length;
+  const othersCurl = average(otherMetrics.map(metrics => metrics.curlRatio));
+  const othersCurledScore = clamp01((1.05 - othersCurl) / 0.25);
 
-  const palmWidth = getPalmWidth(context);
-  const extendedThreshold =
-      config.threshold ?? (palmWidth ? palmWidth * 0.9 : DEFAULT_POINT_THRESHOLD);
-  const curledThreshold =
-      palmWidth ? palmWidth * 0.55 : DEFAULT_FIST_THRESHOLD * 1.1;
+  const confidence = clamp01(
+      (indexCurlScore * 0.45) + (indexReachScore * 0.25) +
+      (othersCurledScore * 0.3));
 
-  const indexScore = THREE.MathUtils.clamp(
-      (indexDistance - extendedThreshold) / (extendedThreshold * 0.6), 0, 1);
-  const othersScore = THREE.MathUtils.clamp(
-      (curledThreshold - averageOthers) / (curledThreshold * 0.9), 0, 1);
-
-  const confidence = (indexScore * 0.7) + (othersScore * 0.3);
   return {
-    confidence: THREE.MathUtils.clamp(confidence, 0, 1),
-    data: {indexDistance, averageOthers},
+    confidence,
+    data: {
+      indexCurlScore,
+      indexReachScore,
+      othersCurledScore,
+      threshold: config.threshold,
+    },
   };
 }
 
 function computeSpread(context: HandContext, config: GestureConfiguration) {
-  const thumb = getJoint(context, 'thumb-tip');
-  const index = getJoint(context, 'index-finger-tip');
-  const middle = getJoint(context, 'middle-finger-tip');
-  const ring = getJoint(context, 'ring-finger-tip');
-  const pinky = getJoint(context, 'pinky-finger-tip');
-  if (!thumb || !index || !middle || !ring || !pinky) return undefined;
+  const fingerMetrics = getFingerMetrics(context);
+  if (!fingerMetrics.length) return undefined;
 
-  const pairs: [THREE.Vector3, THREE.Vector3][] = [
-    [thumb, index],
-    [index, middle],
-    [middle, ring],
-    [ring, pinky],
-  ];
-  const distances = pairs.map(([a, b]) => a.distanceTo(b));
-  const average = distances.reduce((sum, v) => sum + v, 0) / distances.length;
+  const handScale = estimateHandScale(context);
+  const palmWidth = getPalmWidth(context) ?? handScale * 0.85;
+  const neighbors = getAdjacentFingerDistances(context);
 
+  const spreadScore =
+      neighbors.average !== Infinity && palmWidth > EPSILON ?
+      clamp01((neighbors.average - palmWidth * 0.6) / (palmWidth * 0.35)) :
+      0;
+  const extensionScore = clamp01(
+      (average(fingerMetrics.map(metrics => metrics.curlRatio)) - 1.15) / 0.45);
+
+  const confidence =
+      clamp01((spreadScore * 0.6) + (extensionScore * 0.4));
+
+  return {
+    confidence,
+    data: {
+      spreadScore,
+      extensionScore,
+      threshold: config.threshold,
+    },
+  };
+}
+
+type FingerMetrics = {
+  tip: THREE.Vector3;
+  metacarpal?: THREE.Vector3;
+  referenceDistance: number;
+  tipDistance: number;
+  curlRatio: number;
+};
+
+type ThumbMetrics = {
+  tip: THREE.Vector3;
+  metacarpal?: THREE.Vector3;
+  referenceDistance: number;
+  tipDistance: number;
+};
+
+function computeFingerMetric(context: HandContext, finger: FingerName) {
+  const tip = getFingerJoint(context, finger, 'tip');
+  const proximal = getFingerJoint(context, finger, 'phalanx-proximal');
+  const metacarpal = getFingerJoint(context, finger, 'metacarpal');
+  const wrist = getJoint(context, 'wrist');
+  if (!tip || !wrist) return null;
+
+  const reference = proximal ?? metacarpal;
+  if (!reference) return null;
+
+  const referenceDistance = reference.distanceTo(wrist);
+  const tipDistance = tip.distanceTo(wrist);
+  const curlRatio =
+      referenceDistance > EPSILON ? tipDistance / referenceDistance : 0;
+
+  return {
+    tip,
+    metacarpal,
+    referenceDistance,
+    tipDistance,
+    curlRatio,
+  };
+}
+
+function getFingerMetrics(context: HandContext) {
+  return FINGER_ORDER.map(
+             finger => computeFingerMetric(context, finger))
+      .filter(Boolean) as FingerMetrics[];
+}
+
+function getThumbMetrics(context: HandContext): ThumbMetrics|undefined {
+  const tip = getJoint(context, 'thumb-tip');
+  const wrist = getJoint(context, 'wrist');
+  if (!tip || !wrist) return undefined;
+
+  const metacarpal =
+      getJoint(context, 'thumb-metacarpal') ??
+      getJoint(context, 'thumb-phalanx-proximal');
+  if (!metacarpal) return undefined;
+
+  const referenceDistance = metacarpal.distanceTo(wrist);
+  const tipDistance = tip.distanceTo(wrist);
+
+  return {
+    tip,
+    metacarpal,
+    referenceDistance,
+    tipDistance,
+  };
+}
+
+function estimateHandScale(context: HandContext) {
+  const wrist = getJoint(context, 'wrist');
+  const middleTip = getJoint(context, 'middle-finger-tip');
+  const middleBase = getJoint(context, 'middle-finger-metacarpal');
   const palmWidth = getPalmWidth(context);
-  const baseThreshold =
-      palmWidth ? palmWidth * 0.45 : DEFAULT_SPREAD_THRESHOLD;
-  const threshold = config.threshold ?? baseThreshold;
 
-  const confidence = THREE.MathUtils.clamp(
-      (average - threshold) / (threshold * 0.6), 0, 1);
-  return {confidence, data: {averageDistance: average}};
-}
+  const measurements: number[] = [];
+  if (wrist && middleTip) measurements.push(middleTip.distanceTo(wrist));
+  if (palmWidth) measurements.push(palmWidth);
+  if (wrist && middleBase) measurements.push(middleBase.distanceTo(wrist) * 2);
 
-function getJoint(context: HandContext, jointName: string) {
-  return context.joints.get(jointName);
-}
-
-function getFingerTips(context: HandContext) {
-  const tips: THREE.Vector3[] = [];
-  const names = [
-    'thumb-tip',
-    'index-finger-tip',
-    'middle-finger-tip',
-    'ring-finger-tip',
-    'pinky-finger-tip',
-  ];
-  for (const name of names) {
-    const joint = getJoint(context, name);
-    if (joint) tips.push(joint);
-  }
-  return tips;
+  if (!measurements.length) return 0.08;
+  return average(measurements);
 }
 
 function getPalmWidth(context: HandContext) {
-  const indexBase = getJoint(context, 'index-finger-metacarpal');
-  const pinkyBase = getJoint(context, 'pinky-finger-metacarpal');
+  const indexBase = getFingerJoint(context, 'index', 'metacarpal');
+  const pinkyBase = getFingerJoint(context, 'pinky', 'metacarpal');
   if (!indexBase || !pinkyBase) return null;
   return indexBase.distanceTo(pinkyBase);
 }
 
 function getPalmNormal(context: HandContext) {
   const wrist = getJoint(context, 'wrist');
-  const indexBase = getJoint(context, 'index-finger-metacarpal');
-  const pinkyBase = getJoint(context, 'pinky-finger-metacarpal');
+  const indexBase = getFingerJoint(context, 'index', 'metacarpal');
+  const pinkyBase = getFingerJoint(context, 'pinky', 'metacarpal');
   if (!wrist || !indexBase || !pinkyBase) return null;
 
   const u = new THREE.Vector3().subVectors(indexBase, wrist);
@@ -232,20 +331,55 @@ function getPalmNormal(context: HandContext) {
   return normal.normalize();
 }
 
+function getPalmRight(context: HandContext) {
+  const indexBase = getFingerJoint(context, 'index', 'metacarpal');
+  const pinkyBase = getFingerJoint(context, 'pinky', 'metacarpal');
+  if (!indexBase || !pinkyBase) return null;
+  const right = new THREE.Vector3().subVectors(indexBase, pinkyBase);
+  if (context.handLabel === 'left') right.multiplyScalar(-1);
+  if (right.lengthSq() === 0) return null;
+  return right.normalize();
+}
+
+function getPalmUp(context: HandContext) {
+  const normal = getPalmNormal(context);
+  const right = getPalmRight(context);
+  if (!normal || !right) return null;
+
+  const up = new THREE.Vector3().copy(right).cross(normal);
+  if (up.lengthSq() === 0) return null;
+  return up.normalize();
+}
+
 function getAdjacentFingerDistances(context: HandContext) {
-  const index = getJoint(context, 'index-finger-tip');
-  const middle = getJoint(context, 'middle-finger-tip');
-  const ring = getJoint(context, 'ring-finger-tip');
-  const pinky = getJoint(context, 'pinky-finger-tip');
-  if (!index || !middle || !ring || !pinky) {
+  const tips = FINGER_ORDER.map(
+      finger => getFingerJoint(context, finger, 'tip'));
+  if (tips.some(tip => !tip)) {
     return {average: Infinity};
   }
   const distances = [
-    index.distanceTo(middle),
-    middle.distanceTo(ring),
-    ring.distanceTo(pinky),
+    tips[0]!.distanceTo(tips[1]!),
+    tips[1]!.distanceTo(tips[2]!),
+    tips[2]!.distanceTo(tips[3]!),
   ];
-  const average = distances.reduce((sum, value) => sum + value, 0) /
-      distances.length;
-  return {average};
+  return {average: average(distances)};
+}
+
+function getJoint(context: HandContext, jointName: string) {
+  return context.joints.get(jointName);
+}
+
+function getFingerJoint(
+    context: HandContext, finger: FingerName, suffix: string) {
+  const prefix = FINGER_PREFIX[finger];
+  return getJoint(context, `${prefix}-${suffix}`);
+}
+
+function clamp01(value: number) {
+  return THREE.MathUtils.clamp(value, 0, 1);
+}
+
+function average(values: number[]) {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
